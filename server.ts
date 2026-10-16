@@ -1,3 +1,6 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 import http from 'http';
 import express from 'express';
 import { WebSocketServer } from 'ws';
@@ -13,7 +16,7 @@ const __dirname = path.dirname(__filename);
 async function startServer() {
   const app = express();
   const server = http.createServer(app);
-  const port = 3000;
+  const port = parseInt(process.env.PORT || '3000', 10);
 
   app.use(express.json());
 
@@ -37,7 +40,12 @@ async function startServer() {
   });
 
   app.get('/api/history/:asset', async (req, res) => {
-    const asset = req.params.asset.toUpperCase() as AssetId;
+    const assetParam = (req.params.asset || '').toUpperCase();
+    const allowed: string[] = ['GOLD', 'US100', 'HK.CASH', 'FRA40'];
+    if (!allowed.includes(assetParam)) {
+      return res.status(400).json({ error: 'Asset inválido' });
+    }
+    const asset = assetParam as AssetId;
     const history = await marketHub.getHistoryAsync(asset);
     res.json({
       asset,
@@ -112,8 +120,8 @@ async function startServer() {
         : `⚡ ALERTA DE TRADING NO ${asset || 'GOLD'}`;
 
     marketHub.triggerAlert({
-      asset: asset || 'GOLD',
-      type: type || 'BUY',
+      asset: (asset || 'GOLD') as AssetId,
+      type: (type || 'BUY') as any,
       price,
       targetPrice: type === 'BUY' ? price * 1.008 : price * 0.992,
       stopLossPrice: type === 'BUY' ? price * 0.996 : price * 1.004,
@@ -172,6 +180,26 @@ async function startServer() {
     console.log(`[RAPTOR] Server listening on http://0.0.0.0:${port}`);
     console.log(`[RAPTOR] WebSocket ready at ws://0.0.0.0:${port}/ws`);
   });
+
+  // Graceful shutdown
+  const shutdown = async (signal: string) => {
+    console.info(`[RAPTOR] ${signal} recebido — finalizando...`);
+    try {
+      marketHub.stop();
+      server.close(() => {
+        console.info('[RAPTOR] HTTP server fechado.');
+        process.exit(0);
+      });
+      // force exit after 10s
+      setTimeout(() => process.exit(1), 10_000);
+    } catch (err) {
+      console.error('[RAPTOR] Erro durante shutdown:', err);
+      process.exit(1);
+    }
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 startServer().catch((err) => {

@@ -1,4 +1,6 @@
 import WebSocket, { WebSocketServer } from 'ws';
+import fs from 'fs';
+import path from 'path';
 import { AssetId, MarketQuote, AlertSignal, AlertType, MacroEvent, OhlcCandle, HubStatus, ProviderType, NewsItem, AgentOperation } from './types';
 import { getConfig, updateConfig } from './config';
 import { TradingViewProvider, TvTickData } from './providers/tradingView';
@@ -20,6 +22,8 @@ export class MarketHub {
   private tradingViewProvider: TradingViewProvider | null = null;
   private yahooPollInterval: NodeJS.Timeout | null = null;
   private staleCheckInterval: NodeJS.Timeout | null = null;
+  private syncInterval: NodeJS.Timeout | null = null;
+  private pulseInterval: NodeJS.Timeout | null = null;
   private startTime = Date.now();
 
   private assetCache: Record<AssetId, CachedAssetData> = {
@@ -30,10 +34,29 @@ export class MarketHub {
   };
 
   private alertsHistory: AlertSignal[] = [];
+  private recentAlerts: Map<string, number> = new Map();
+
+  // Telegram rate limiting state
+  private telegramSentTodayDate: string = '';
+  private telegramSentTodayCount: number = 0;
+  private lastTelegramSentAt: number = 0;
+
+  private dataDir: string;
 
   constructor() {
+    this.dataDir = path.resolve(process.cwd(), 'server', 'data');
+    try { fs.mkdirSync(this.dataDir, { recursive: true }); } catch(e) {}
+
     this.initDefaultQuotes();
-    this.tradingViewProvider = new TradingViewProvider((tick) => this.handleTradingViewTick(tick));
+    this.loadPersistedAlerts();
+
+    // provider creation is kept but might be replaced/mocked in tests
+    try {
+      this.tradingViewProvider = new TradingViewProvider((tick) => this.handleTradingViewTick(tick));
+    } catch (e:any) {
+      console.warn('[MarketHub] Falha ao instanciar TradingViewProvider:', e?.message || e);
+      this.tradingViewProvider = null;
+    }
   }
 
   private initDefaultQuotes() {
@@ -74,6 +97,28 @@ export class MarketHub {
     }
   }
 
+  private persistAlertsToDisk() {
+    try {
+      const file = path.join(this.dataDir, 'alerts.json');
+      fs.writeFileSync(file, JSON.stringify(this.alertsHistory, null, 2), { encoding: 'utf-8' });
+    } catch (e:any) {
+      console.warn('[MarketHub] Falha ao persistir alerts:', e?.message || e);
+    }
+  }
+
+  private loadPersistedAlerts() {
+    try {
+      const file = path.join(this.dataDir, 'alerts.json');
+      if (fs.existsSync(file)) {
+        const raw = fs.readFileSync(file, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) this.alertsHistory = parsed;
+      }
+    } catch (e:any) {
+      console.warn('[MarketHub] Falha ao carregar alerts persistidos:', e?.message || e);
+    }
+  }
+
   public attachWebSocketServer(wss: WebSocketServer) {
     this.wss = wss;
 
@@ -95,7 +140,8 @@ export class MarketHub {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify(snapshot));
         }
-      }).catch(() => {
+      }).catch((err:any) => {
+        console.warn('[MarketHub] NewsProvider.fetchLatestNews falhou:', err?.message || err);
         const snapshot = {
           type: 'SNAPSHOT',
           quotes: this.getAllQuotes(),
@@ -141,7 +187,9 @@ export class MarketHub {
         config: getConfig(),
         timestamp: Date.now(),
       }));
-    }).catch(() => {});
+    }).catch((err:any) => {
+      console.warn('[MarketHub] NewsProvider.fetchLatestNews falhou (SSE):', err?.message || err);
+    });
   }
 
   public removeSseClient(client: { send: (data: string) => void }) {
@@ -150,10 +198,10 @@ export class MarketHub {
 
   public async start() {
     console.log('[MarketHub] Iniciando engine de dados TradingView sem chaves...');
-    
+
     // 0. Sincroniza histórico de velas reais OHLCV do mercado ao vivo
     await this.syncAllRealCandles();
-    setInterval(() => {
+    this.syncInterval = setInterval(() => {
       this.syncAllRealCandles();
     }, 45000);
 
@@ -171,7 +219,7 @@ export class MarketHub {
     }, 15000);
 
     // 4. Fluxo contínuo de Ticks em Milissegundos (cada 500ms para preços vivos e dinâmicos)
-    setInterval(() => {
+    this.pulseInterval = setInterval(() => {
       this.pulseLiveTicks();
     }, 500);
   }
@@ -208,7 +256,7 @@ export class MarketHub {
 
       // Atualiza a vela ativa
       const activeCandle = this.updateCandleHistory(asset, nextPrice, 1);
-      
+
       // Avalia agentes em M15
       const analysis = strategyEngine.analyze(asset, nextPrice, cached.history);
       if (analysis.hasSignal && analysis.signal) {
@@ -294,7 +342,7 @@ export class MarketHub {
           console.log(`[MarketHub] Sincronizadas ${candles.length} velas contínuas de ${asset} (último: ${updatedLast.close})`);
         }
       } catch (e: any) {
-        console.warn(`[MarketHub] Falha no sync de ${asset}:`, e.message);
+        console.warn(`[MarketHub] Falha no sync de ${asset}:`, e?.message || e);
       }
     }
   }
@@ -303,6 +351,9 @@ export class MarketHub {
     if (this.tradingViewProvider) this.tradingViewProvider.stop();
     if (this.yahooPollInterval) clearInterval(this.yahooPollInterval);
     if (this.staleCheckInterval) clearInterval(this.staleCheckInterval);
+    if (this.syncInterval) { clearInterval(this.syncInterval); this.syncInterval = null; }
+    if (this.pulseInterval) { clearInterval(this.pulseInterval); this.pulseInterval = null; }
+    console.info('[MarketHub] Todos os timers foram limpos.');
   }
 
   private handleClientMessage(ws: WebSocket, data: any) {
@@ -311,7 +362,7 @@ export class MarketHub {
       const alertType: AlertType = data.alertType || 'BUY';
       const quote = this.assetCache[asset]?.quote;
       const price = quote?.price || 4187.7;
-      
+
       const titlePt =
         alertType === 'BUY'
           ? `🟢 SINAL DE COMPRA CONFIRMADO NO ${asset}`
@@ -346,6 +397,7 @@ export class MarketHub {
       if (target) {
         target.acknowledged = true;
         this.broadcast({ type: 'ALERT_ACKNOWLEDGED', id });
+        this.persistAlertsToDisk();
       }
     } else if (data.action === 'DISPATCH_TELEGRAM_TEST') {
       this.sendTelegramNotification(
@@ -486,12 +538,16 @@ export class MarketHub {
     const symbol = config.symbols[asset].yahoo;
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=2m&range=1d`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
       const res = await fetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           Accept: 'application/json',
         },
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
       if (!res.ok) return;
       const json = await res.json();
       const meta = json.chart?.result?.[0]?.meta;
@@ -533,7 +589,9 @@ export class MarketHub {
       cached.lastPrice = price;
 
       this.broadcast({ type: 'TICK', quote, latencyMs: 45 });
-    } catch (e) {}
+    } catch (e:any) {
+      console.warn(`[MarketHub] fetchYahooContingency(${asset}) erro:`, e?.message || e);
+    }
   }
 
   private checkDataStaleness() {
@@ -583,10 +641,22 @@ export class MarketHub {
       referenceOnly: params.referenceOnly ?? false,
     };
 
+    // Dedupe simples por par asset:type em janela curta
+    const dedupeKey = `${signal.asset}:${signal.type}`;
+    const lastTs = this.recentAlerts.get(dedupeKey) || 0;
+    if (Date.now() - lastTs < 30_000) {
+      console.info(`[MarketHub] Ignorando alerta duplicado para ${dedupeKey}`);
+      return;
+    }
+    this.recentAlerts.set(dedupeKey, Date.now());
+
     this.alertsHistory.push(signal);
     if (this.alertsHistory.length > 80) {
       this.alertsHistory.shift();
     }
+
+    // persistir
+    this.persistAlertsToDisk();
 
     // Broadcast instantâneo para a interface
     this.broadcast({
@@ -595,7 +665,9 @@ export class MarketHub {
     });
 
     // Despacho no Telegram se configurado
-    this.sendTelegramAlert(signal);
+    this.sendTelegramAlert(signal).catch((err:any) => {
+      console.warn('[MarketHub] Falha ao enviar alerta telegram:', err?.message || err);
+    });
   }
 
   private async sendTelegramAlert(alert: AlertSignal) {
@@ -614,19 +686,9 @@ export class MarketHub {
     };
 
     const emoji = emojiMap[alert.type] || '⚡';
-    const msg = `${emoji} <b>RAPTOR — ${alert.titlePt}</b>
-<b>Ativo:</b> ${alert.asset}
-<b>Preço de Entrada:</b> ${alert.price}
-<b>Alvo (Take Profit):</b> ${alert.targetPrice || 'N/A'}
-<b>Stop Loss:</b> ${alert.stopLossPrice || 'N/A'}
-<b>Risco/Retorno:</b> ${alert.riskReward || '1:2.0'}
-<b>Convicção do Agente:</b> ${alert.confidence}%
-<b>Horário:</b> ${new Date(alert.timestamp).toLocaleTimeString('pt-BR')}
+    const msg = `${emoji} <b>RAPTOR — ${alert.titlePt}</b>\n<b>Ativo:</b> ${alert.asset}\n<b>Preço de Entrada:</b> ${alert.price}\n<b>Alvo (Take Profit):</b> ${alert.targetPrice || 'N/A'}\n<b>Stop Loss:</b> ${alert.stopLossPrice || 'N/A'}\n<b>Risco/Retorno:</b> ${alert.riskReward || '1:2.0'}\n<b>Convicção do Agente:</b> ${alert.confidence}%\n<b>Horário:</b> ${new Date(alert.timestamp).toLocaleTimeString('pt-BR')}\n\n<b>Análise do Agente:</b>\n${alert.reason}`;
 
-<b>Análise do Agente:</b>
-${alert.reason}`;
-
-    this.sendTelegramNotification(msg);
+    await this.sendTelegramNotification(msg);
   }
 
   public async sendTelegramNotification(textHtml: string): Promise<boolean> {
@@ -635,8 +697,28 @@ ${alert.reason}`;
     const chatId = config.telegram.chatId;
     if (!token || !chatId) return false;
 
+    // Rate limit: no more than 1 msg / 2s and no more than 500 msgs/day (configurable)
+    const now = Date.now();
+    if (now - this.lastTelegramSentAt < 2000) {
+      console.info('[MarketHub] Telegram rate limit: mensagem suprimida (freq alta)');
+      return false;
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    if (this.telegramSentTodayDate !== today) {
+      this.telegramSentTodayDate = today;
+      this.telegramSentTodayCount = 0;
+    }
+    const maxPerDay = config.telegram.maxPerDay || 500;
+    if (this.telegramSentTodayCount >= maxPerDay) {
+      console.info('[MarketHub] Telegram rate limit diário atingido');
+      return false;
+    }
+
     try {
       const url = `https://api.telegram.org/bot${token}/sendMessage`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -645,9 +727,16 @@ ${alert.reason}`;
           text: textHtml,
           parse_mode: 'HTML',
         }),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
+
+      this.lastTelegramSentAt = Date.now();
+      this.telegramSentTodayCount++;
+
       return res.ok;
-    } catch (e) {
+    } catch (e:any) {
+      console.warn('[MarketHub] Erro ao chamar Telegram API:', e?.message || e);
       return false;
     }
   }
@@ -695,6 +784,7 @@ ${alert.reason}`;
     if (target) {
       target.acknowledged = true;
       this.broadcast({ type: 'ALERT_ACKNOWLEDGED', id });
+      this.persistAlertsToDisk();
       return true;
     }
     return false;
@@ -722,8 +812,8 @@ ${alert.reason}`;
       activeClientsCount: this.clientConnections.size,
       providers: {
         tradingView: {
-          connected: true,
-          status: 'CONECTADO_TEMPO_REAL',
+          connected: !!this.tradingViewProvider,
+          status: this.tradingViewProvider ? 'CONECTADO_TEMPO_REAL' : 'DESCONHECIDO',
           lastPing: now,
         },
         yahoo: { active: true, lastPoll: now },
